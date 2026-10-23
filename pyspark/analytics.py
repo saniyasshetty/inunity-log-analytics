@@ -1,9 +1,8 @@
-
 import hashlib
 import math
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -12,18 +11,13 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    Table,
     LongTable,
     TableStyle,
-    PageBreak,
-    KeepTogether,
 )
-
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.barcharts import (
     HorizontalBarChart,
@@ -33,8 +27,6 @@ from reportlab.graphics.charts.barcharts import (
 
 BUCKET_NAME = "inunity-log-analytics-dev"
 REPORT_S3_KEY = "reports/inunity_log_analytics_report.pdf"
-
-# Number of rows displayed in detailed tables
 TOP_N = 20
 
 
@@ -44,21 +36,16 @@ def parse_timestamp(value):
         return None
 
     try:
-        return datetime.fromisoformat(
-            str(value).replace("Z", "+00:00")
-        )
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
 
 
 def normalize_path(path):
-    """
-    Replace variable IDs so requests to the same API operation
-    can be grouped together.
-    """
+    """Replace variable IDs so requests to the same API can be grouped."""
     path = str(path or "UNKNOWN").split("?")[0]
 
-    # UUIDs, such as 79e9b067-c987-4832-856b-2b270a02bfd4
+    # UUIDs
     path = re.sub(
         r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -67,35 +54,30 @@ def normalize_path(path):
     )
 
     # Long hexadecimal IDs
-    path = re.sub(
-        r"(?i)(?<=/)[0-9a-f]{24,}(?=/|$)",
-        "{id}",
-        path,
-    )
+    path = re.sub(r"(?i)(?<=/)[0-9a-f]{24,}(?=/|$)", "{id}", path)
 
     # Numeric IDs in path segments
-    path = re.sub(
-        r"(?<=/)\d+(?=/|$)",
-        "{id}",
-        path,
-    )
+    path = re.sub(r"(?<=/)\d+(?=/|$)", "{id}", path)
 
     return path
 
 
 def identify_feature(path):
     """Assign API paths to broad application feature categories."""
-    p = path.lower()
+    path = path.lower()
 
     rules = [
         ("Notifications", ("notification",)),
         ("Tokens", ("token", "fcm")),
         ("User Management", ("user", "profile", "interest", "favorite")),
-        ("Academic Structure", (
-            "department", "academic-year", "academic-years",
-            "classroom", "course", "semester", "program",
-            "batch", "role", "instructor",
-        )),
+        (
+            "Academic Structure",
+            (
+                "department", "academic-year", "academic-years",
+                "classroom", "course", "semester", "program",
+                "batch", "role", "instructor",
+            ),
+        ),
         ("Attendance", ("attendance",)),
         ("Assignments", ("assignment", "deadline", "submission")),
         ("Events", ("event", "calendar")),
@@ -113,13 +95,14 @@ def identify_feature(path):
     ]
 
     for feature, keywords in rules:
-        if any(keyword in p for keyword in keywords):
+        if any(keyword in path for keyword in keywords):
             return feature
 
     return "Other"
 
 
 def analyze_logs(records):
+    """Calculate request, client, feature, timeline, and spike statistics."""
     if not records:
         raise ValueError("No records available for analysis.")
 
@@ -147,17 +130,14 @@ def analyze_logs(records):
         operation_counts[operation] += 1
         feature_counts[identify_feature(normalized_path)] += 1
 
-        # The transformation task may already hash remote_addr.
-        # If it is still an IP address, hash it here before reporting.
+        # The transformation stage may already have hashed remote_addr.
         client = str(record.get("remote_addr") or "").strip()
 
         if client:
             if ":" in client or re.fullmatch(
                 r"\d{1,3}(?:\.\d{1,3}){3}", client
             ):
-                client = hashlib.sha256(
-                    client.encode("utf-8")
-                ).hexdigest()
+                client = hashlib.sha256(client.encode("utf-8")).hexdigest()
 
             client_counts[client] += 1
 
@@ -166,47 +146,39 @@ def analyze_logs(records):
         if timestamp is not None:
             timestamps.append(timestamp)
 
-            # Full date and hour
             hour_key = timestamp.strftime("%Y-%m-%d %H:00")
             hourly_traffic[hour_key] += 1
-
-            # Hour of day: 0 through 23
             hour_of_day_counts[timestamp.hour] += 1
 
-            # Requests per minute for spike detection
+            # Count requests per minute for each API operation.
             minute_key = timestamp.strftime("%Y-%m-%d %H:%M")
-            minute_operation_counts[
-                (minute_key, operation)
-            ] += 1
+            minute_operation_counts[(minute_key, operation)] += 1
 
-    # Endpoint spike candidates.
-    # This is a heuristic, not proof of an incident.
+    # Compare operations across all observed minutes.
     all_minutes = sorted({
         minute for minute, _ in minute_operation_counts
     })
 
-    minute_count = max(len(all_minutes), 1)
-    operation_minute_counts = defaultdict(list)
-
-    for (minute, operation), count in minute_operation_counts.items():
-        operation_minute_counts[operation].append((minute, count))
-
     spike_candidates = []
 
-    for operation, minute_values in operation_minute_counts.items():
-        counts = [count for _, count in minute_values]
-        average_per_minute = sum(counts) / minute_count
+    for operation in operation_counts:
+        counts = [
+            minute_operation_counts.get((minute, operation), 0)
+            for minute in all_minutes
+        ]
 
-        # Approximate threshold: average + 3 standard deviations,
-        # using a Poisson-style approximation for sparse traffic.
-        threshold = max(
-            10,
-            average_per_minute + 3 * math.sqrt(
-                max(average_per_minute, 0)
-            ),
-        )
+        if not counts:
+            continue
 
-        for minute, count in minute_values:
+        average_per_minute = sum(counts) / len(counts)
+        variance = sum(
+            (count - average_per_minute) ** 2 for count in counts
+        ) / len(counts)
+        standard_deviation = math.sqrt(variance)
+
+        threshold = max(10, average_per_minute + 3 * standard_deviation)
+
+        for minute, count in zip(all_minutes, counts):
             if count > threshold:
                 date_part, time_part = minute.split(" ")
                 hour, minute_number = time_part.split(":")
@@ -224,6 +196,9 @@ def analyze_logs(records):
         key=lambda item: item["requests"],
         reverse=True,
     )
+    spike_candidates = spike_candidates[:20]
+
+    top_operations = dict(operation_counts.most_common(TOP_N))
 
     results = {
         "total_requests": total_requests,
@@ -232,24 +207,22 @@ def analyze_logs(records):
         "unique_clients": len(client_counts),
         "unique_features": len(feature_counts),
         "start_date": (
-            min(timestamps).strftime("%Y-%m-%d")
-            if timestamps else "Unknown"
+            min(timestamps).strftime("%Y-%m-%d") if timestamps else "Unknown"
         ),
         "end_date": (
-            max(timestamps).strftime("%Y-%m-%d")
-            if timestamps else "Unknown"
+            max(timestamps).strftime("%Y-%m-%d") if timestamps else "Unknown"
         ),
-        "top_operations": dict(operation_counts.most_common(TOP_N)),
+        "top_operations": top_operations,
         "operation_counts": dict(operation_counts),
         "traffic_percentages": {
             operation: round(count / total_requests * 100, 2)
-            for operation, count in operation_counts.most_common(TOP_N)
+            for operation, count in top_operations.items()
         },
         "path_counts": dict(path_counts.most_common(TOP_N)),
         "hourly_traffic": dict(sorted(hourly_traffic.items())),
         "hour_of_day": dict(sorted(hour_of_day_counts.items())),
         "top_clients": dict(client_counts.most_common(TOP_N)),
-        "spike_candidates": spike_candidates[:20],
+        "spike_candidates": spike_candidates,
         "feature_usage": dict(feature_counts.most_common()),
     }
 
@@ -264,6 +237,7 @@ def analyze_logs(records):
 
 
 def generate_pdf_report(results, pdf_path):
+    """Generate the PDF report from the analysis results."""
     os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
 
     styles = getSampleStyleSheet()
@@ -303,14 +277,10 @@ def generate_pdf_report(results, pdf_path):
     story = []
     page_width = A4[0] - 70
 
-    story.append(Paragraph(
-        "InUnity Log Analytics Report",
-        styles["Title"],
-    ))
+    story.append(Paragraph("InUnity Log Analytics Report", styles["Title"]))
     story.append(Spacer(1, 4))
     story.append(Paragraph(
-        f"Analysis period: {results['start_date']} to "
-        f"{results['end_date']}",
+        f"Analysis period: {results['start_date']} to {results['end_date']}",
         styles["ReportSubtitle"],
     ))
     story.append(Spacer(1, 16))
@@ -327,11 +297,9 @@ def generate_pdf_report(results, pdf_path):
             return
 
         table_data = [headers]
-
         for row in rows:
             table_data.append([
-                Paragraph(str(value), styles["SmallCell"])
-                for value in row
+                Paragraph(str(value), styles["SmallCell"]) for value in row
             ])
 
         if widths is None:
@@ -343,7 +311,6 @@ def generate_pdf_report(results, pdf_path):
             repeatRows=1,
             hAlign="LEFT",
         )
-
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#24476B")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -364,15 +331,20 @@ def generate_pdf_report(results, pdf_path):
         story.append(Spacer(1, 10))
 
     def add_horizontal_chart(title, items, max_items=10):
-        items = list(items.items())[:max_items]
+        # Select the highest-count items first.
+        items = sorted(
+            items.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:max_items]
 
         if not items:
             return
 
         story.append(Paragraph(title, styles["SectionHeading"]))
 
-        # Reverse for more readable top-to-bottom ordering.
-        items = list(reversed(items))
+        # Reverse so the highest item appears at the top of the chart.
+        items = items
         labels = [str(label)[:42] for label, _ in items]
         values = [int(value) for _, value in items]
 
@@ -392,9 +364,7 @@ def generate_pdf_report(results, pdf_path):
         chart.valueAxis.labels.fontSize = 7
         chart.valueAxis.valueMin = 0
         chart.valueAxis.valueMax = max(values) * 1.15 if max(values) else 1
-        chart.valueAxis.valueStep = max(
-            1, int(chart.valueAxis.valueMax / 5)
-        )
+        chart.valueAxis.valueStep = max(1, int(chart.valueAxis.valueMax / 5))
         chart.bars[0].fillColor = colors.HexColor("#3676A8")
         chart.barWidth = 10
 
@@ -422,9 +392,7 @@ def generate_pdf_report(results, pdf_path):
         chart.valueAxis.labels.fontSize = 7
         chart.valueAxis.valueMin = 0
         chart.valueAxis.valueMax = max(values) * 1.15 if max(values) else 1
-        chart.valueAxis.valueStep = max(
-            1, int(chart.valueAxis.valueMax / 5)
-        )
+        chart.valueAxis.valueStep = max(1, int(chart.valueAxis.valueMax / 5))
         chart.bars[0].fillColor = colors.HexColor("#3676A8")
         chart.barWidth = max(
             4, min(14, chart.width / max(len(values) * 1.6, 1))
@@ -434,12 +402,14 @@ def generate_pdf_report(results, pdf_path):
         story.append(drawing)
         story.append(Spacer(1, 8))
 
+    total_requests = results["total_requests"]
+
     # 1. Overall summary
     add_table(
         "1. Overall Summary",
         ["Metric", "Value"],
         [
-            ["Total Requests", results["total_requests"]],
+            ["Total Requests", total_requests],
             ["Unique API Operations", results["unique_api_operations"]],
             ["Unique Clients", results["unique_clients"]],
             ["Unique Features", results["unique_features"]],
@@ -454,11 +424,7 @@ def generate_pdf_report(results, pdf_path):
         "2. Request Type Distribution",
         ["HTTP Method", "Request Count", "Traffic (%)"],
         [
-            [
-                method,
-                count,
-                f"{count / results['total_requests'] * 100:.2f}",
-            ]
+            [method, count, f"{count / total_requests * 100:.2f}"]
             for method, count in results["method_counts"].items()
         ],
         [page_width * 0.35, page_width * 0.35, page_width * 0.30],
@@ -470,17 +436,19 @@ def generate_pdf_report(results, pdf_path):
         list(results["method_counts"].values()),
     )
 
-    # 3. Top operations and traffic share
+    # 3. Top API operations, sorted by request count.
+    sorted_operations = sorted(
+        results["top_operations"].items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
     add_table(
         "3. Top API Operations",
         ["Operation", "Requests", "Traffic (%)"],
         [
-            [
-                operation,
-                count,
-                f"{count / results['total_requests'] * 100:.2f}",
-            ]
-            for operation, count in results["top_operations"].items()
+            [operation, count, f"{count / total_requests * 100:.2f}"]
+            for operation, count in sorted_operations
         ],
         [page_width * 0.60, page_width * 0.20, page_width * 0.20],
     )
@@ -491,54 +459,40 @@ def generate_pdf_report(results, pdf_path):
         10,
     )
 
-    add_table(
-        "4. API Traffic Percentage",
-        ["Operation", "Requests", "Traffic (%)"],
-        [
-            [operation, count, percentage]
-            for operation, count in results["top_operations"].items()
-            for percentage in [
-                results["traffic_percentages"][operation]
-            ]
-        ],
-        [page_width * 0.60, page_width * 0.20, page_width * 0.20],
-    )
-
-    # 5. Traffic by hour of day
-    hourly_by_day = results["hourly_traffic"]
+    # 4. Traffic by hour of day
     hour_of_day = results["hour_of_day"]
 
     add_vertical_chart(
-        "5. Traffic by Hour of Day",
+        "4. Traffic by Hour of Day",
         list(hour_of_day.keys()),
         list(hour_of_day.values()),
     )
 
-    
     add_table(
-    "Hourly Traffic Summary",
-    ["Hour of Day", "Request Count"],
-    [
-        [f"{int(hour):02d}:00–{int(hour):02d}:59", count]
-        for hour, count in hour_of_day.items()
-    ],
-    [page_width * 0.65, page_width * 0.35],
-)
-
-
-    # 6. Top clients. Values are hashes if the transformation
-    # stage has hashed remote_addr.
-    add_table(
-        "6. Top Clients (Hashed Addresses)",
-        ["Client Hash", "Request Count"],
+        "Hourly Traffic Summary",
+        ["Hour of Day", "Request Count"],
         [
-            [client, count]
-            for client, count in results["top_clients"].items()
+            [f"{int(hour):02d}:00–{int(hour):02d}:59", count]
+            for hour, count in hour_of_day.items()
         ],
+        [page_width * 0.65, page_width * 0.35],
+    )
+
+    # 5. Top clients, sorted by request count.
+    sorted_clients = sorted(
+        results["top_clients"].items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    add_table(
+        "5. Top Clients (Hashed Addresses)",
+        ["Client Hash", "Request Count"],
+        [[client, count] for client, count in sorted_clients],
         [page_width * 0.75, page_width * 0.25],
     )
 
-    # 7. Endpoint spike candidates
+    # 6. Endpoint spike candidates
     spike_rows = [
         [
             item["date"],
@@ -552,7 +506,7 @@ def generate_pdf_report(results, pdf_path):
     ]
 
     add_table(
-        "7. Endpoint Spike Candidates",
+        "6. Endpoint Spike Candidates",
         ["Date", "Hour", "Minute", "Operation", "Requests", "Threshold"],
         spike_rows,
         [
@@ -565,21 +519,19 @@ def generate_pdf_report(results, pdf_path):
         ],
     )
 
-    # 8. Feature usage
+    # 7. Feature usage, sorted by request count.
+    sorted_features = sorted(
+        results["feature_usage"].items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
     add_table(
-        "8. Feature Usage",
+        "7. Feature Usage",
         ["Feature", "Request Count", "Traffic (%)"],
         [
-            [
-                feature,
-                count,
-                f"{count / results['total_requests'] * 100:.2f}",
-            ]
-            for feature, count in sorted(
-                results["feature_usage"].items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
+            [feature, count, f"{count / total_requests * 100:.2f}"]
+            for feature, count in sorted_features
         ],
         [page_width * 0.50, page_width * 0.25, page_width * 0.25],
     )
@@ -590,14 +542,11 @@ def generate_pdf_report(results, pdf_path):
         10,
     )
 
-    # 9. Full hourly timeline
+    # 8. Full hourly timeline
     add_table(
-        "9. Hourly Traffic by Date",
+        "8. Hourly Traffic by Date",
         ["Date and Hour", "Request Count"],
-        [
-            [hour, count]
-            for hour, count in hourly_by_day.items()
-        ],
+        list(results["hourly_traffic"].items()),
         [page_width * 0.65, page_width * 0.35],
     )
 
@@ -606,6 +555,7 @@ def generate_pdf_report(results, pdf_path):
 
 
 def upload_pdf_to_s3(pdf_path):
+    """Upload the generated report to the configured S3 key."""
     s3_hook = S3Hook(aws_conn_id="aws_default")
     s3_hook.load_file(
         filename=pdf_path,
@@ -613,7 +563,6 @@ def upload_pdf_to_s3(pdf_path):
         bucket_name=BUCKET_NAME,
         replace=True,
     )
-
     print(f"PDF uploaded to s3://{BUCKET_NAME}/{REPORT_S3_KEY}")
 
 

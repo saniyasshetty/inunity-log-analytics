@@ -1,56 +1,63 @@
 
-import hashlib
-from datetime import datetime
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 
-def transform_logs(records):
-    cleaned_records = []
-    seen_records = set()
+def transform_logs(df: DataFrame) -> DataFrame:
+    """Validate logs, remove duplicates, and hash client addresses."""
 
-    for record in records:
-        # Check required fields
-        required_fields = [
-            "timestamp",
-            "request_id",
-            "method",
-            "path"
-        ]
+    initial_count = df.count()
 
-        if any(not record.get(field) for field in required_fields):
-            continue
+    # 1. Keep records with all required fields.
+    required_fields = ["timestamp", "request_id", "method", "path"]
 
-        # Validate timestamp
-        try:
-            datetime.fromisoformat(
-                record["timestamp"].replace("Z", "+00:00")
-            )
-        except (ValueError, TypeError):
-            continue
+    for field in required_fields:
+        df = df.filter(
+            F.col(field).isNotNull()
+            & (F.trim(F.col(field).cast("string")) != "")
+        )
 
-        # Remove duplicate records
-        record_key = str(sorted(record.items()))
+    # 2. Parse timestamps safely.
+    # Convert UTC suffix Z into an explicit UTC offset.
+    timestamp_text = F.regexp_replace(
+        F.col("timestamp").cast("string"),
+        "Z$",
+        "+00:00"
+    )
 
-        if record_key in seen_records:
-            continue
+    timestamp_format = F.lit(
+        "yyyy-MM-dd'T'HH:mm:ss.SSSXX"
+    )
 
-        seen_records.add(record_key)
+    df = df.withColumn(
+        "_parsed_timestamp",
+        F.try_to_timestamp(timestamp_text, timestamp_format)
+    )
 
-        # Protect IP address by hashing it
-        cleaned_record = record.copy()
-        ip_address = cleaned_record.get("remote_addr")
+    # Remove records with invalid timestamps.
+    df = df.filter(F.col("_parsed_timestamp").isNotNull())
 
-        if ip_address:
-            cleaned_record["remote_addr"] = hashlib.sha256(
-                str(ip_address).encode()
-            ).hexdigest()
+    # 3. Remove exact duplicate records.
+    df = df.dropDuplicates()
 
-        cleaned_records.append(cleaned_record)
+    # 4. Hash client addresses for privacy.
+    if "remote_addr" in df.columns:
+        df = df.withColumn(
+            "remote_addr",
+            F.when(
+                F.col("remote_addr").isNotNull()
+                & (F.trim(F.col("remote_addr").cast("string")) != ""),
+                F.sha2(F.col("remote_addr").cast("string"), 256)
+            ).otherwise(F.col("remote_addr"))
+        )
 
-    print(f"Records received: {len(records)}")
-    print(f"Records after cleaning: {len(cleaned_records)}")
+    df = df.drop("_parsed_timestamp")
 
-    return cleaned_records
+    print(f"Records received: {initial_count}")
+    print("Transformation applied using PySpark DataFrame operations.")
+
+    return df
 
 
 if __name__ == "__main__":
-    print("Transformation module is ready.")
+    print("PySpark transformation module is ready.")

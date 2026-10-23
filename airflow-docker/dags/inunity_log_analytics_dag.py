@@ -1,10 +1,11 @@
 
 from datetime import datetime
-import sys
 import os
+import sys
 
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
+from pyspark.sql import SparkSession
 
 sys.path.insert(0, "/opt/airflow/pyspark")
 
@@ -16,34 +17,97 @@ from analytics import (
     upload_pdf_to_s3,
 )
 
+DATA_DIR = "/opt/airflow/data"
+RAW_PARQUET_PATH = os.path.join(DATA_DIR, "raw_logs")
+CLEAN_PARQUET_PATH = os.path.join(DATA_DIR, "cleaned_logs")
 PDF_PATH = "/opt/airflow/reports/inunity_log_analytics_report.pdf"
 
 
+def create_spark_session(app_name):
+    return (
+        SparkSession.builder
+        .master("local[*]")
+        .appName(app_name)
+        .getOrCreate()
+    )
+
+
 def run_extract():
-    return extract_logs()
+    spark = create_spark_session("InUnityExtract")
+
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        df = extract_logs(spark)
+
+        df.write.mode("overwrite").parquet(RAW_PARQUET_PATH)
+
+        print(f"Raw Parquet data saved to {RAW_PARQUET_PATH}")
+        return RAW_PARQUET_PATH
+    finally:
+        spark.stop()
 
 
 def run_transform(ti):
-    records = ti.xcom_pull(task_ids="extract_logs")
-    return transform_logs(records)
+    raw_path = ti.xcom_pull(task_ids="extract_logs")
+    if not raw_path:
+        raise ValueError("Raw Parquet path was not received.")
+
+    spark = create_spark_session("InUnityTransform")
+
+    try:
+        df = spark.read.parquet(raw_path)
+        cleaned_df = transform_logs(df)
+
+        cleaned_df.write.mode("overwrite").parquet(
+            CLEAN_PARQUET_PATH
+        )
+
+        print(f"Cleaned Parquet data saved to {CLEAN_PARQUET_PATH}")
+        return CLEAN_PARQUET_PATH
+    finally:
+        spark.stop()
 
 
 def run_analytics(ti):
-    records = ti.xcom_pull(task_ids="transform_logs")
-    results = analyze_logs(records)
-    return results
+    cleaned_path = ti.xcom_pull(task_ids="transform_logs")
+    if not cleaned_path:
+        raise ValueError("Cleaned Parquet path was not received.")
+
+    spark = create_spark_session("InUnityAnalytics")
+
+    try:
+        df = spark.read.parquet(cleaned_path)
+
+        # The existing analytics module expects Python dictionaries.
+        # Convert rows only at this reporting stage.
+        records = [
+            row.asDict(recursive=True)
+            for row in df.toLocalIterator()
+        ]
+
+        results = analyze_logs(records)
+        return results
+    finally:
+        spark.stop()
 
 
 def run_generate_pdf(ti):
     results = ti.xcom_pull(task_ids="analytics")
+    if not results:
+        raise ValueError("Analytics results were not received.")
+
     generate_pdf_report(results, PDF_PATH)
     return PDF_PATH
 
 
 def run_upload_pdf(ti):
     pdf_path = ti.xcom_pull(task_ids="generate_pdf")
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF report not found: {pdf_path}")
+
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise FileNotFoundError(
+            f"PDF report not found: {pdf_path}"
+        )
 
     upload_pdf_to_s3(pdf_path)
 
@@ -53,7 +117,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
-    tags=["inunity", "data-engineering"],
+    tags=["inunity", "data-engineering", "pyspark"],
 ) as dag:
 
     extract_task = PythonOperator(

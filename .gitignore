@@ -27,3 +27,4 @@ tmp/
 .DS_Store
 Thumbs.db
 /airflow-docker/config/airflow.cfg
+data/
